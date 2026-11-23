@@ -22,20 +22,21 @@ on:
   workflow_dispatch:
 
 env:
-  # Xcode 26.3 on the macos-15 runner image. The README asks for "Xcode 26.1
-  # or later"; macos-15 ships 26.3, which satisfies it. macos-26 (newer image,
-  # Xcode 26.4.1) was tried first and the job sat in `queued` for 15+ minutes
-  # with no runner assigned -- that label has far less capacity on the free
-  # tier than the default macos-15. VirtualAndroid builds everything from
-  # source, so unlike Husk (whose vendored StikJIT.framework needed Swift 6.4)
-  # there is no hard requirement on macos-26.
-  XCODE_VERSION: '26.3'
+  # Xcode 26.6 on the macos-26 runner image. The README asks for "Xcode 26.1
+  # or later"; macos-26 ships 26.6 default. macos-15 ships 26.3 and was tried
+  # for ~25 minutes across three runs, but the hosted-runner scheduler kept
+  # returning internal-server-error / auto-cancelling with no runner acquired
+  # ("The job was not acquired by Runner of type hosted even after multiple
+  # attempts"). macos-26 uses a different runner pool, so it's the right
+  # alternative. macos-14 is NOT viable: it tops out at Xcode 16.2, which
+  # would fail the README's Xcode 26.1 floor at the Select Xcode step.
+  XCODE_VERSION: '26.6'
   ANDROID_IMAGE: 'system-images;android-33;default;arm64-v8a'
 
 jobs:
   build:
     name: Build .ipa (macOS arm64)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 200
 
     steps:
