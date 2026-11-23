@@ -1,0 +1,174 @@
+# Build VirtualAndroid's .ipa on every push to main.
+#
+# Pipeline (from README.md "Building"), all on one macOS arm64 runner:
+#   deps → QEMU tcg → QEMU tcti → xcframeworks → renderer (aemu, gfxstream,
+#   ANGLE, libva_gfx) for ios + ios-sim → android-33 system image →
+#   userdata/ImagePack → unsigned Release app → .ipa.
+#
+# The build is unsigned (CODE_SIGNING_ALLOWED=NO): the README's device install
+# needs a paid team for the kernel-memory entitlements, but sideloaders
+# (SideStore / AltStore / TrollStore) re-sign at install, so CI only needs to
+# produce the binary. The ImagePack is uploaded as its own artifact because the
+# app does not bundle it — it is imported from Documents on first launch
+# ("Import image pack folder…" in the app, or Finder file sharing).
+#
+# Skipped on purpose: the AOT cache (optional, needs profiled runs of the exact
+# engine build; without it the TCTI engine just runs uncached — docs/AOT.md).
+name: Build .ipa
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Xcode 26.4 (Swift 6.4) on the macos-26 runner image. The README asks for
+  # Xcode 26.1 or later; macos-15 caps at 26.3, macos-26 has 26.4.1.
+  XCODE_VERSION: '26.4'
+  ANDROID_IMAGE: 'system-images;android-33;default;arm64-v8a'
+
+jobs:
+  build:
+    name: Build .ipa (macOS arm64)
+    runs-on: macos-26
+    timeout-minutes: 200
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Clone the QEMU fork (engine/qemu)
+        # The engine's QEMU (ranchu board, goldfish devices, AOT runtime) lives
+        # in its own repo and is not a submodule; README clones it by hand.
+        run: |
+          git clone --depth 1 https://github.com/spianmo/VirtualAndroid-qemu.git engine/qemu
+          git -C engine/qemu rev-parse --short HEAD
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          swift --version
+
+      - name: Install build tools
+        run: |
+          brew update >/dev/null
+          # README's list, plus qemu (only for qemu-img, which
+          # app/scripts/make_userdata_qcow2.sh needs to write the userdata
+          # qcow2s; we point it at the brew binary with QEMU_IMG=), plus the
+          # autotools/cmake the UTM dependency recipe can reach for.
+          brew install meson ninja pkg-config bison glib e2fsprogs xcodegen qemu \
+                       cmake libtool autoconf automake
+          # Homebrew's python3 is PEP 668 externally-managed; --break-system-
+          # packages is its documented escape hatch for CI. mako/pyyaml are the
+          # modules meson-based dependency builds most commonly want at
+          # configure time; cheap insurance.
+          /opt/homebrew/bin/pip3 install --break-system-packages pyyaml mako
+
+      - name: Cache fetched sources (UTM recipe, tarballs, gfx pins)
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/UTM
+            third_party/dl
+            gfx/src
+          key: va-sources-${{ runner.os }}-v1
+
+      - name: Fetch sources (deps recipe + gfx pins)
+        run: |
+          engine/scripts/ios/fetch_deps.sh
+          gfx/scripts/fetch-sources.sh
+
+      - name: Build dependencies for iOS
+        run: engine/scripts/ios/build_deps.sh -p ios
+
+      - name: Build QEMU, tcg backend (JIT path)
+        run: engine/scripts/ios/build_qemu.sh -p ios -b tcg -s engine/qemu
+
+      - name: Build QEMU, tcti backend (no-JIT path)
+        run: engine/scripts/ios/build_qemu.sh -p ios -b tcti -s engine/qemu
+
+      - name: Package engine xcframeworks (tcg + tcti)
+        run: engine/scripts/ios/make_xcframeworks.sh --device-backend tcg+tcti
+
+      - name: Renderer (aemu, gfxstream, ANGLE, libva_gfx) for ios + ios-sim
+        run: |
+          for P in ios-sim ios; do
+            gfx/scripts/build-aemu.sh $P
+            gfx/scripts/build-gfxstream.sh $P
+            gfx/scripts/build-angle.sh $P
+            gfx/libva_gfx/build.sh $P
+            gfx/scripts/package-apple.sh $P
+          done
+          gfx/scripts/package-apple.sh xcframework
+
+      - name: Fetch the Android 13 system image (android-33, arm64-v8a)
+        run: |
+          # GitHub's macOS images ship the Android cmdline tools with
+          # ANDROID_HOME set; if that changes, fall back to brew's cask so the
+          # workflow still works.
+          if [ -z "${ANDROID_HOME:-}" ] || [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            brew install --cask android-commandlinetools
+            export ANDROID_HOME="$(brew --prefix)/share/android-commandlinetools"
+          fi
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null || true
+          "$SDKM" "$ANDROID_IMAGE" > /dev/null
+          # make_userdata_qcow2.sh --pack expects the image contents at
+          # images/android-33/arm64-v8a (kernel-ranchu, ramdisk.img, system.img,
+          # vendor.img); the SDK path ends in the same components.
+          mkdir -p images/android-33
+          cp -R "$ANDROID_HOME/system-images/android-33/default/arm64-v8a" images/android-33/
+          ls -la images/android-33/arm64-v8a | head -12
+
+      - name: Build the userdata disks + ImagePack
+        run: |
+          # QEMU_IMG override: the script defaults to a macOS-host qemu-img at
+          # engine/build-macos/, which we did not build; brew's qemu provides
+          # the same tool.
+          QEMU_IMG="$(brew --prefix)/bin/qemu-img" \
+            app/scripts/make_userdata_qcow2.sh --pack
+          du -sh app/build/ImagePack
+
+      - name: Generate the Xcode project and build (unsigned Release)
+        run: |
+          cd app
+          xcodegen generate
+          cd ..
+          xcodebuild -project app/VirtualAndroid.xcodeproj -scheme VirtualAndroid \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath app/build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee app/build/build.log | grep -E "error:|warning: .*\.swift|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" app/build/build.log
+
+      - name: Package the .ipa
+        run: |
+          APP=app/build/dd/Build/Products/Release-iphoneos/VirtualAndroid.app
+          [ -d "$APP" ] || { echo "app bundle missing: $APP" >&2; exit 1; }
+          rm -rf Payload VirtualAndroid.ipa ImagePack.zip
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry VirtualAndroid.ipa Payload
+          # Zip from app/build so the archive contains ImagePack/ at its root,
+          # not the nested app/build/ImagePack/ path.
+          ( cd app/build && zip -qry ImagePack.zip ImagePack && mv ImagePack.zip ../../ )
+          ls -lh VirtualAndroid.ipa ImagePack.zip
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualAndroid-ipa
+          path: VirtualAndroid.ipa
+          if-no-files-found: error
+
+      - name: Upload ImagePack artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualAndroid-ImagePack
+          path: ImagePack.zip
+          if-no-files-found: error
