@@ -18,7 +18,7 @@ name: Build .ipa
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   workflow_dispatch:
 
 env:
