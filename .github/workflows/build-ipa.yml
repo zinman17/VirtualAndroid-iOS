@@ -1,6 +1,6 @@
 # Build VirtualAndroid's .ipa on every push to main.
 #
-# Pipeline (from README.md "Building"), all on one macOS arm64 runner:
+# Pipeline (from README.md "Building"), all on one macOS arm64 runneim:
 #   deps → QEMU tcg → QEMU tcti → renderer (aemu, gfxstream, ANGLE, libva_gfx)
 #   for ios + ios-sim → android-33 system image → userdata/ImagePack →
 #   AOT capture (TCTI boot in the simulator) → va_aot.framework →
@@ -39,13 +39,13 @@ env:
   # attempts"). macos-26 uses a different runner pool, so it's the right
   # alternative. macos-14 is NOT viable: it tops out at Xcode 16.2, which
   # would fail the README's Xcode 26.1 floor at the Select Xcode step.
-  XCODE_VERSION: '26.6'
+  XCODE_VERSION: '6'
   ANDROID_IMAGE: 'system-images;android-33;default;arm64-v8a'
 
 jobs:
   build:
     name: Build .ipa (macOS arm64)
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 200
 
     steps:
