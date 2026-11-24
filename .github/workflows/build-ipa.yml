@@ -31,13 +31,15 @@ on:
   workflow_dispatch:
 
 env:
-  XCODE_VERSION: '26.6'
+  # macos-15 ships Xcode 16.0–16.4 and 26.0.1–26.3 (Xcode 15 is not installed
+  # on macos-15). Using 26.3 satisfies the Xcode 26.1+ requirement on macos-15.
+  XCODE_VERSION: '26.3'
   ANDROID_IMAGE: 'system-images;android-33;default;arm64-v8a'
 
 jobs:
   build:
     name: Build .ipa (macOS arm64)
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 200
 
     steps:
@@ -99,10 +101,8 @@ jobs:
           TARGET_DEV="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
           if [ -d "$TARGET_DEV" ]; then
             sudo xcode-select -s "$TARGET_DEV"
-          elif [ -d "/Applications/Xcode_26.6.app/Contents/Developer" ]; then
-            sudo xcode-select -s "/Applications/Xcode_26.6.app/Contents/Developer"
           else
-            echo "::warning::Target Xcode not found; keeping current developer directory"
+            echo "::warning::${TARGET_DEV} not found; keeping current developer directory"
           fi
 
           echo "Active developer dir: $(xcode-select -p)"
