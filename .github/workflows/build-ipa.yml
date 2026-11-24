@@ -72,7 +72,20 @@ jobs:
         # .wrap files. build_qemu.sh's own fallback (copy from engine/qemu) is a
         # no-op against a fresh clone because those dirs are git-ignored there
         # too; this step is what actually fills them in.
+        #
+        # bilge-impl-0.2-rs.wrap references a diff_files entry
+        # (bilge-impl-1.63.0.patch) that is not shipped in the fork and not in
+        # upstream QEMU either -- the file simply does not exist. meson aborts
+        # the download of that one subproject with:
+        #   -> Diff file "engine/qemu/subprojects/packagefiles/bilge-impl-1.63.0.patch" does not exist
+        # The patch is named for Rust 1.63.0: it is a compatibility shim for
+        # older Rust toolchains, and modern Rust (the runner has 1.85+) does not
+        # need it. Creating it empty makes meson's wrap system apply a no-op and
+        # the download completes; the crate builds unmodified under modern Rust.
+        # Verified locally: with the empty file present, 'meson subprojects
+        # download bilge-impl-0.2-rs' reports 'done' and exits 0.
         run: |
+          touch engine/qemu/subprojects/packagefiles/bilge-impl-1.63.0.patch
           meson subprojects download --sourcedir engine/qemu
           echo "--- subprojects populated: ---"
           ls engine/qemu/subprojects/ | grep -vE '\.wrap$|\.wraplock$|\.gitignore$' || true
