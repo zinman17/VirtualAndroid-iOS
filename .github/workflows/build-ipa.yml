@@ -52,27 +52,37 @@ jobs:
           git clone --depth 1 https://github.com/spianmo/VirtualAndroid-qemu.git engine/qemu
           git -C engine/qemu rev-parse --short HEAD
 
+      - name: Install build tools
+        # Done early (before any meson step): build_qemu.sh -b tcg/tcti configures
+        # QEMU with --disable-download, which requires the wrap subprojects to
+        # already be checked out. They are git-ignored in the fork (subprojects/
+        # holds the .wrap files; the populated source dirs are not tracked), so a
+        # fresh clone lacks them and meson dies with "ERROR: missing subprojects"
+        # at the very first configure. We download them once here, after the
+        # install step that provides meson, then both backends reuse them.
+        run: |
+          brew update >/dev/null
+          brew install meson ninja pkg-config bison glib e2fsprogs xcodegen qemu \
+                       cmake libtool autoconf automake
+          /opt/homebrew/bin/pip3 install --break-system-packages pyyaml mako
+
+      - name: Download QEMU's wrap subprojects
+        # meson subprojects download populates engine/qemu/subprojects/{dtc,
+        # keycodemapdb,berkeley-softfloat-3,berkeley-testfloat-3,...} from the
+        # .wrap files. build_qemu.sh's own fallback (copy from engine/qemu) is a
+        # no-op against a fresh clone because those dirs are git-ignored there
+        # too; this step is what actually fills them in.
+        run: |
+          meson subprojects download --sourcedir engine/qemu
+          echo "--- subprojects populated: ---"
+          ls engine/qemu/subprojects/ | grep -vE '\.wrap$|\.wraplock$|\.gitignore$' || true
+
       - name: Select Xcode
         run: |
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
           swift --version
-
-      - name: Install build tools
-        run: |
-          brew update >/dev/null
-          # README's list, plus qemu (only for qemu-img, which
-          # app/scripts/make_userdata_qcow2.sh needs to write the userdata
-          # qcow2s; we point it at the brew binary with QEMU_IMG=), plus the
-          # autotools/cmake the UTM dependency recipe can reach for.
-          brew install meson ninja pkg-config bison glib e2fsprogs xcodegen qemu \
-                       cmake libtool autoconf automake
-          # Homebrew's python3 is PEP 668 externally-managed; --break-system-
-          # packages is its documented escape hatch for CI. mako/pyyaml are the
-          # modules meson-based dependency builds most commonly want at
-          # configure time; cheap insurance.
-          /opt/homebrew/bin/pip3 install --break-system-packages pyyaml mako
 
       - name: Cache fetched sources (UTM recipe, tarballs, gfx pins)
         uses: actions/cache@v4
