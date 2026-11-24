@@ -1,6 +1,6 @@
 # Build VirtualAndroid's .ipa on every push to main.
 #
-# Pipeline (from README.md "Building"), all on one macOS arm64 runneim:
+# Pipeline (from README.md "Building"), all on one macOS arm64 runner:
 #   deps → QEMU tcg → QEMU tcti → renderer (aemu, gfxstream, ANGLE, libva_gfx)
 #   for ios + ios-sim → android-33 system image → userdata/ImagePack →
 #   AOT capture (TCTI boot in the simulator) → va_aot.framework →
@@ -31,21 +31,13 @@ on:
   workflow_dispatch:
 
 env:
-  # Xcode 26.6 on the macos-26 runner image. The README asks for "Xcode 26.1
-  # or later"; macos-26 ships 26.6 default. macos-15 ships 26.3 and was tried
-  # for ~25 minutes across three runs, but the hosted-runner scheduler kept
-  # returning internal-server-error / auto-cancelling with no runner acquired
-  # ("The job was not acquired by Runner of type hosted even after multiple
-  # attempts"). macos-26 uses a different runner pool, so it's the right
-  # alternative. macos-14 is NOT viable: it tops out at Xcode 16.2, which
-  # would fail the README's Xcode 26.1 floor at the Select Xcode step.
-  XCODE_VERSION: '6'
+  XCODE_VERSION: '26.6'
   ANDROID_IMAGE: 'system-images;android-33;default;arm64-v8a'
 
 jobs:
   build:
     name: Build .ipa (macOS arm64)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 200
 
     steps:
@@ -101,7 +93,19 @@ jobs:
 
       - name: Select Xcode
         run: |
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          echo "--- Available Xcode installations: ---"
+          ls -ld /Applications/Xcode*.app 2>/dev/null || true
+
+          TARGET_DEV="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          if [ -d "$TARGET_DEV" ]; then
+            sudo xcode-select -s "$TARGET_DEV"
+          elif [ -d "/Applications/Xcode_26.6.app/Contents/Developer" ]; then
+            sudo xcode-select -s "/Applications/Xcode_26.6.app/Contents/Developer"
+          else
+            echo "::warning::Target Xcode not found; keeping current developer directory"
+          fi
+
+          echo "Active developer dir: $(xcode-select -p)"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
           swift --version
@@ -232,7 +236,7 @@ jobs:
             -configuration Release -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath app/build/dd \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGNIDENTITY="" \
             build 2>&1 | tee app/build/build.log | grep -E "error:|warning: .*\.swift|BUILD (SUCCEEDED|FAILED)" || true
           grep -q "BUILD SUCCEEDED" app/build/build.log
 
