@@ -1,9 +1,10 @@
 # Build VirtualAndroid's .ipa on every push to main.
 #
 # Pipeline (from README.md "Building"), all on one macOS arm64 runner:
-#   deps → QEMU tcg → QEMU tcti → xcframeworks → renderer (aemu, gfxstream,
-#   ANGLE, libva_gfx) for ios + ios-sim → android-33 system image →
-#   userdata/ImagePack → unsigned Release app → .ipa.
+#   deps → QEMU tcg → QEMU tcti → renderer (aemu, gfxstream, ANGLE, libva_gfx)
+#   for ios + ios-sim → android-33 system image → userdata/ImagePack →
+#   AOT capture (TCTI boot in the simulator) → va_aot.framework →
+#   xcframeworks → unsigned Release app → .ipa.
 #
 # The build is unsigned (CODE_SIGNING_ALLOWED=NO): the README's device install
 # needs a paid team for the kernel-memory entitlements, but sideloaders
@@ -12,8 +13,16 @@
 # app does not bundle it — it is imported from Documents on first launch
 # ("Import image pack folder…" in the app, or Finder file sharing).
 #
-# Skipped on purpose: the AOT cache (optional, needs profiled runs of the exact
-# engine build; without it the TCTI engine just runs uncached — docs/AOT.md).
+# The AOT translation cache (docs/AOT.md) is generated in CI: a TCTI boot in
+# the iOS Simulator records the hot TB ops (QEMU_AOT_CAPTURE), and
+# build_aot.sh compiles them into va_aot.framework, bound to the device TCTI
+# slice (helper offsets via nm, paired by hash in make_xcframeworks.sh). The
+# app embed phase globs the framework in and the runtime passes it to QEMU as
+# QEMU_AOT_LIB. Without the cache the TCTI engine runs uncached — about 2.3x
+# slower boot on the sim numbers in docs/AOT.md. The capture boot is
+# non-fatal: if it fails, the IPA ships plain (uncached) TCTI like before and
+# the log says so explicitly.
+
 name: Build .ipa
 
 on:
@@ -120,10 +129,22 @@ jobs:
       - name: Build QEMU, tcti backend (no-JIT path)
         run: engine/scripts/ios/build_qemu.sh -p ios -b tcti -s engine/qemu
 
-      - name: Package engine xcframeworks (tcg + tcti)
-        run: engine/scripts/ios/make_xcframeworks.sh --device-backend tcg+tcti
+      - name: Build dependencies for the simulator (AOT capture host)
+        # The AOT capture boot runs the TCTI engine inside the iOS Simulator —
+        # the device slice cannot execute on macOS, and docs/AOT.md requires
+        # the capture to come from a TCTI build of the same source and
+        # configuration as the device slice. The capture ops are portable
+        # between the sim and device builds; build_aot.sh binds them to the
+        # device binary via nm. This is the same pipeline as docs/AOT.md
+        # "iOS integration" step 2.
+        run: engine/scripts/ios/build_deps.sh -p ios_simulator
+
+      - name: Build QEMU, tcti backend for the simulator (AOT capture host)
+        run: engine/scripts/ios/build_qemu.sh -p ios_simulator -b tcti -s engine/qemu
 
       - name: Renderer (aemu, gfxstream, ANGLE, libva_gfx) for ios + ios-sim
+        # Also what the capture boot's ranchu machine loads (--gfx-lib auto
+        # defaults to gfx/build-ios-sim/dist/libva_gfx.dylib).
         run: |
           for P in ios-sim ios; do
             gfx/scripts/build-aemu.sh $P
@@ -148,7 +169,8 @@ jobs:
           "$SDKM" "$ANDROID_IMAGE" > /dev/null
           # make_userdata_qcow2.sh --pack expects the image contents at
           # images/android-33/arm64-v8a (kernel-ranchu, ramdisk.img, system.img,
-          # vendor.img); the SDK path ends in the same components.
+          # vendor.img); the SDK path ends in the same components. run_sim.sh
+          # uses the same images/ path for the AOT capture boot.
           mkdir -p images/android-33
           cp -R "$ANDROID_HOME/system-images/android-33/default/arm64-v8a" images/android-33/
           ls -la images/android-33/arm64-v8a | head -12
@@ -161,6 +183,45 @@ jobs:
           QEMU_IMG="$(brew --prefix)/bin/qemu-img" \
             app/scripts/make_userdata_qcow2.sh --pack
           du -sh app/build/ImagePack
+
+      - name: Capture AOT ops (TCTI boot in the simulator)
+        # Boot Android under the simulator TCTI engine with QEMU_AOT_CAPTURE
+        # set (SIMCTL_CHILD_ passes it through simctl spawn): QEMU records the
+        # TCG ops of every TB it translates into aot-cap.txt. The boot stops at
+        # the bootanim milestone (or 25 min on slower runners), quitting QEMU
+        # through the monitor so qemu_cleanup flushes the capture.
+        # Non-fatal: if the simulator boot fails for any reason, the IPA still
+        # ships with plain (uncached) TCTI — exactly the old behaviour — and
+        # the next step's gate skips the cache build with a loud note.
+        continue-on-error: true
+        run: |
+          rm -f aot-cap.txt
+          SIMCTL_CHILD_QEMU_AOT_CAPTURE="$PWD/aot-cap.txt" \
+            engine/scripts/ios/run_sim.sh -b tcti --fresh --name aotcap \
+            --until bootanim --timeout 1500
+          ls -lh aot-cap.txt || true
+          tail -5 engine/build-ios/run/aotcap/milestones.txt 2>/dev/null || true
+
+      - name: Build the AOT translation cache (va_aot.framework)
+        # tcg2c.py turns the captured ops into native arm64 functions bound to
+        # the device TCTI binary (helper offsets read with nm from that exact
+        # binary), build_aot.sh compiles them and packages va_aot.framework
+        # next to the TCTI slice. make_xcframeworks.sh below pairs it with the
+        # TCTI slice it is bound to (bound-qemu.sha1), and the app's embed
+        # phase already globs every xcframework in engine/build-ios/xcframeworks.
+        run: |
+          if [ ! -s aot-cap.txt ]; then
+            echo "WARNING: no AOT capture — the simulator boot failed above;"
+            echo "shipping plain (uncached) TCTI. The AOT cache will not be in this IPA."
+            exit 0
+          fi
+          engine/scripts/ios/build_aot.sh -p ios -c "$PWD/aot-cap.txt"
+
+      - name: Package engine xcframeworks (tcg + tcti + AOT)
+        # Runs AFTER build_aot.sh on purpose: make_xcframeworks.sh adds
+        # va_aot.xcframework only for TCTI slices whose binary hash matches
+        # qemu-tcti/aot/bound-qemu.sha1.
+        run: engine/scripts/ios/make_xcframeworks.sh --device-backend tcg+tcti
 
       - name: Generate the Xcode project and build (unsigned Release)
         run: |
@@ -179,6 +240,14 @@ jobs:
         run: |
           APP=app/build/dd/Build/Products/Release-iphoneos/VirtualAndroid.app
           [ -d "$APP" ] || { echo "app bundle missing: $APP" >&2; exit 1; }
+          # If a capture was produced, the AOT framework must have made it into
+          # the app (embed phase globs engine/build-ios/xcframeworks; a missing
+          # framework here means the pairing or embed step silently failed).
+          if [ -s aot-cap.txt ] && [ ! -d "$APP/Frameworks/va_aot.framework" ]; then
+            echo "FATAL: AOT capture exists but va_aot.framework is not in the app bundle" >&2
+            echo "(check make_xcframeworks.sh pairing and the embed phase above)" >&2
+            exit 1
+          fi
           rm -rf Payload VirtualAndroid.ipa ImagePack.zip
           mkdir Payload
           cp -R "$APP" Payload/
