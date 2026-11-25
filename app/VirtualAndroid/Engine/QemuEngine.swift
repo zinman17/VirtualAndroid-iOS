@@ -437,6 +437,10 @@ final class QemuEngine: VMEngine {
         if accel == .tcti {
             if let aot = Self.aotLibraryPath {
                 env["QEMU_AOT_LIB"] = aot
+                // Make the active cache visible in the boot log: AOT is passed to
+                // QEMU via this environment variable, never as a -VAAOT argv flag
+                // (that spelling is the app-level `-VAAOT NO` A/B switch, docs/AOT.md).
+                log(1, "AOT translation cache active (QEMU_AOT_LIB=\((aot as NSString).lastPathComponent))")
             } else {
                 log(1, "TCTI without the AOT cache (va_aot.framework not embedded, or -VAAOT NO)")
             }
